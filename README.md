@@ -168,9 +168,18 @@ Cloudflare Queues does not expose individual job listings via the REST API. The 
 
 Laravel Horizon is **not fully supported**.
 
-### Delayed Jobs
+### Delayed Jobs (Arbitrary Delays Supported)
 
-Cloudflare Queues supports `delay_seconds` up to the queue's maximum delay (currently 12 hours). Delayed jobs work via `->delay()` or `Queue::later()`.
+Cloudflare Queues caps `delay_seconds` at 12 hours (43,200 seconds). This package transparently handles delays beyond that limit using a **hop-based relay** — the payload is re-queued in 12-hour increments until the target time is reached.
+
+```php
+// All of these work, even beyond 12 hours
+MyJob::dispatch($data)->delay(now()->addHours(6));   // single hop
+MyJob::dispatch($data)->delay(now()->addHours(20));  // two hops: 12h + 8h
+MyJob::dispatch($data)->delay(now()->addDays(3));    // six hops of 12h
+```
+
+No configuration required — it works automatically.
 
 ### No Blocking Pop
 

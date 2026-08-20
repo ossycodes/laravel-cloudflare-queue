@@ -9,6 +9,20 @@ use Illuminate\Support\Collection;
 class CloudflareQueue extends Queue implements QueueContract
 {
     /**
+     * Cloudflare's hard maximum for delay_seconds on a single message (12 hours).
+     *
+     * Jobs delayed beyond this are transparently re-queued in 12-hour hops
+     * until the target execution time is reached — supporting arbitrary delays.
+     */
+    const MAX_CF_DELAY_SECONDS = 43_200; // 12 * 3600
+
+    /**
+     * Marker key embedded in the message body when a job needs more than one hop.
+     * Any message containing this key is a delay-relay wrapper, not a real job.
+     */
+    const DELAY_WRAPPER_KEY = '__cf_delay_wrapper';
+
+    /**
      * In-memory buffer of messages pulled in the last batch.
      *
      * Laravel's Worker calls pop() one job at a time. Without a buffer every
@@ -144,12 +158,28 @@ class CloudflareQueue extends Queue implements QueueContract
 
     /**
      * Push a raw payload string onto the queue.
+     *
+     * If the requested delay exceeds Cloudflare's 12-hour maximum, the payload
+     * is wrapped with an absolute target timestamp and queued for the first 12-hour
+     * hop. On each subsequent hop the worker detects the wrapper, re-queues for
+     * the next hop, and ACKs the current message — repeating until the target
+     * time is reached, at which point the original payload is unwrapped and processed.
+     *
+     * Example: a 30-hour delay becomes three hops — 12h, 12h, 6h — then runs.
      */
     public function pushRaw($payload, $queue = null, array $options = []): ?string
     {
-        $this->client->send($payload, (int) ($options['delay'] ?? 0));
+        $delay         = (int) ($options['delay'] ?? 0);
+        $originalUuid  = json_decode($payload, true)['uuid'] ?? null;
 
-        return json_decode($payload, true)['uuid'] ?? null;
+        if ($delay > self::MAX_CF_DELAY_SECONDS) {
+            $payload = $this->wrapForDelayedHop($payload, time() + $delay);
+            $delay   = self::MAX_CF_DELAY_SECONDS;
+        }
+
+        $this->client->send($payload, $delay);
+
+        return $originalUuid;
     }
 
     /**
@@ -198,6 +228,9 @@ class CloudflareQueue extends Queue implements QueueContract
      * Uses an in-memory message buffer: the first pop() in a cycle pulls a
      * full batch from Cloudflare and stores remaining messages locally.
      * Subsequent pop() calls drain the buffer without hitting the API.
+     *
+     * Delay-relay wrappers (jobs delayed beyond 12 hours) are transparently
+     * re-queued for the next hop and skipped — the worker never sees them.
      */
     public function pop($queue = null): ?CloudflareJob
     {
@@ -215,6 +248,15 @@ class CloudflareQueue extends Queue implements QueueContract
 
         $message = array_shift($this->messageBuffer);
 
+        // Handle delay-relay wrappers transparently
+        $message = $this->resolveDelayWrapper($message);
+
+        // resolveDelayWrapper returns null when a wrapper was re-queued for a
+        // future hop — recurse to get the next real job from the buffer.
+        if ($message === null) {
+            return $this->pop($queue);
+        }
+
         return new CloudflareJob(
             $this->container,
             $this->client,
@@ -223,6 +265,65 @@ class CloudflareQueue extends Queue implements QueueContract
             $this->connectionName,
             $this->getQueue($queue),
         );
+    }
+
+    /**
+     * Inspect a pulled message for a delay-relay wrapper.
+     *
+     * - Not a wrapper           → return message unchanged (normal processing)
+     * - Wrapper, time not yet   → re-queue for next hop, ACK current, return null
+     * - Wrapper, time reached   → unwrap and return message with original payload
+     */
+    private function resolveDelayWrapper(array $message): ?array
+    {
+        $body = json_decode($message['body'], associative: true);
+
+        if (! isset($body[self::DELAY_WRAPPER_KEY])) {
+            return $message; // not a wrapper, nothing to do
+        }
+
+        $remaining = (int) $body['__cf_execute_at'] - time();
+
+        if ($remaining > 0) {
+            // Not ready yet — re-queue for the next hop
+            $nextDelay = min($remaining, self::MAX_CF_DELAY_SECONDS);
+
+            if ($remaining <= self::MAX_CF_DELAY_SECONDS) {
+                // Final hop: send the original payload directly with remaining delay
+                $this->client->send($body['__cf_payload'], $nextDelay);
+            } else {
+                // More hops needed: re-send the wrapper with the same execute_at
+                $this->client->send(
+                    $this->wrapForDelayedHop($body['__cf_payload'], (int) $body['__cf_execute_at']),
+                    $nextDelay,
+                );
+            }
+
+            // ACK the current wrapper — it has been handed off to the next hop
+            $this->client->ack($message['lease_id']);
+
+            return null; // signal pop() to move to the next message
+        }
+
+        // Target time reached — unwrap and let the worker process the original job
+        $message['body'] = $body['__cf_payload'];
+
+        return $message;
+    }
+
+    /**
+     * Wrap a payload in a delay-relay envelope for multi-hop delivery.
+     *
+     * @param string $payload    The original job payload to preserve.
+     * @param int    $executeAt  Unix timestamp when the job should actually run.
+     */
+    private function wrapForDelayedHop(string $payload, int $executeAt): string
+    {
+        return json_encode([
+            self::DELAY_WRAPPER_KEY => true,
+            '__cf_execute_at'       => $executeAt,
+            '__cf_payload'          => $payload,
+        ]);
     }
 
     // -------------------------------------------------------------------------

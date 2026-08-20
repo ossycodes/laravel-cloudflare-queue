@@ -271,6 +271,71 @@ php artisan queue:work cloudflare-notifications &
 
 ---
 
+## Delays Beyond 12 Hours — Automatic Hop Relay
+
+Cloudflare Queues caps `delay_seconds` at **43,200 seconds (12 hours)**. If you dispatch a job with a longer delay, this package transparently handles it using a hop-based relay — no configuration needed.
+
+### How it works
+
+When `delay > 43,200s`, `pushRaw()` wraps the original payload in an envelope:
+
+```json
+{
+    "__cf_delay_wrapper": true,
+    "__cf_execute_at": 1234567890,
+    "__cf_payload": "{...original Laravel job payload...}"
+}
+```
+
+`__cf_execute_at` is the absolute Unix timestamp for when the job should actually run. The wrapper is sent with a 12-hour delay — Cloudflare's maximum.
+
+When the worker pulls the wrapper after 12 hours, `pop()` inspects it:
+
+```
+remaining = __cf_execute_at - now()
+
+if remaining > 12h  → re-wrap with same execute_at, re-queue with 12h delay, ACK current
+if remaining ≤ 12h  → send original payload with remaining delay (no wrapper), ACK current
+if remaining ≤ 0    → unwrap, process the original job now
+```
+
+The worker never sees the wrapper — it's an internal relay mechanism.
+
+### Example: a 30-hour delay
+
+```
+Dispatch: MyJob::dispatch()->delay(now()->addHours(30))
+  ↓ execute_at = now + 30h
+  ↓ send wrapper with delay=12h
+
+After 12h: worker pulls wrapper, remaining=18h > 12h
+  → re-queue wrapper with delay=12h
+  → ACK current wrapper
+
+After 24h: worker pulls wrapper, remaining=6h ≤ 12h
+  → send original payload with delay=6h (no wrapper)
+  → ACK current wrapper
+
+After 30h: worker pulls original payload
+  → MyJob::handle() runs ✅
+```
+
+### Usage
+
+```php
+// All of these work transparently
+MyJob::dispatch($data)->delay(now()->addHours(6));    // within 12h, no hops needed
+MyJob::dispatch($data)->delay(now()->addHours(20));   // two hops: 12h + 8h
+MyJob::dispatch($data)->delay(now()->addDays(3));     // six hops of 12h
+MyJob::dispatch($data)->delay(now()->addDays(30));    // 60 hops — works fine
+```
+
+### One thing to be aware of
+
+The worker must be **running** when each hop lands, otherwise the re-queuing is delayed until the next time `queue:work` polls. This is the same behaviour as any other delayed job — if the worker is down, jobs are processed late. The job will never be lost (Cloudflare holds it), just delayed until the worker is back.
+
+---
+
 ## Environment Variable Reference
 
 | Variable | Config key | Default | Required |

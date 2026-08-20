@@ -307,4 +307,175 @@ it('connector returns a CloudflareQueue with valid config', function () {
     expect($queue)->toBeInstanceOf(CloudflareQueue::class);
 });
 
+// -------------------------------------------------------------------------
+// Long delay — hop-based relay (>12 hours)
+// -------------------------------------------------------------------------
+
+it('wraps payload when delay exceeds 12 hours', function () {
+    $payload = json_encode(['uuid' => 'abc-123', 'job' => 'SendEmail']);
+
+    $client = Mockery::mock(CloudflareClient::class);
+    $client->shouldReceive('send')
+        ->once()
+        ->withArgs(function ($sentPayload, $delay) {
+            $body = json_decode($sentPayload, true);
+            // Must be wrapped and capped at MAX_CF_DELAY_SECONDS
+            return isset($body['__cf_delay_wrapper'])
+                && $body['__cf_delay_wrapper'] === true
+                && isset($body['__cf_execute_at'])
+                && isset($body['__cf_payload'])
+                && $delay === \OssyCodes\LaravelCloudflareQueue\CloudflareQueue::MAX_CF_DELAY_SECONDS;
+        });
+
+    $this->makeQueue($client)->pushRaw($payload, null, ['delay' => 50_000]); // ~13.9h
+});
+
+it('sends payload directly when delay is within 12 hours', function () {
+    $payload = json_encode(['uuid' => 'abc-123', 'job' => 'SendEmail']);
+
+    $client = Mockery::mock(CloudflareClient::class);
+    $client->shouldReceive('send')
+        ->once()
+        ->withArgs(function ($sentPayload, $delay) use ($payload) {
+            // Payload must NOT be wrapped
+            $body = json_decode($sentPayload, true);
+            return ! isset($body['__cf_delay_wrapper']) && $delay === 3_600;
+        });
+
+    $this->makeQueue($client)->pushRaw($payload, null, ['delay' => 3_600]); // 1h
+});
+
+it('preserves the original uuid when wrapping a long-delay payload', function () {
+    $payload = json_encode(['uuid' => 'my-uuid-123', 'job' => 'SendEmail']);
+
+    $client = Mockery::mock(CloudflareClient::class);
+    $client->shouldReceive('send')->once();
+
+    $uuid = $this->makeQueue($client)->pushRaw($payload, null, ['delay' => 50_000]);
+
+    expect($uuid)->toBe('my-uuid-123');
+});
+
+it('pop re-queues a delay wrapper that is not yet ready and returns next real job', function () {
+    $futureTime = time() + 10_000; // 10,000 seconds in the future
+
+    $wrapperMessage = $this->makeMessage([
+        'id'       => 'wrapper-msg',
+        'lease_id' => 'lease-wrapper',
+        'body'     => json_encode([
+            '__cf_delay_wrapper' => true,
+            '__cf_execute_at'    => $futureTime,
+            '__cf_payload'       => json_encode(['uuid' => 'real-job', 'job' => 'SendEmail']),
+        ]),
+    ]);
+
+    $realMessage = $this->makeMessage(['id' => 'real-msg']);
+
+    $client = Mockery::mock(CloudflareClient::class);
+    // First pull returns the wrapper + real message
+    $client->shouldReceive('pull')->once()->andReturn([$wrapperMessage, $realMessage]);
+    // Wrapper should be re-queued (remaining ~10,000s ≤ 12h → final hop, original payload sent)
+    $client->shouldReceive('send')->once();
+    // Wrapper should be ACK'd
+    $client->shouldReceive('ack')->once()->with('lease-wrapper');
+
+    $queue = $this->makeQueue($client);
+    $job   = $queue->pop();
+
+    // Should skip the wrapper and return the real job
+    expect($job->getJobId())->toBe('real-msg');
+});
+
+it('pop processes a delay wrapper whose time has arrived', function () {
+    $pastTime = time() - 5; // 5 seconds ago — time has come
+
+    $originalPayload = json_encode(['uuid' => 'real-uuid', 'job' => 'SendEmail']);
+
+    $wrapperMessage = $this->makeMessage([
+        'id'       => 'wrapper-msg',
+        'lease_id' => 'lease-wrapper',
+        'body'     => json_encode([
+            '__cf_delay_wrapper' => true,
+            '__cf_execute_at'    => $pastTime,
+            '__cf_payload'       => $originalPayload,
+        ]),
+    ]);
+
+    $client = Mockery::mock(CloudflareClient::class);
+    $client->shouldReceive('pull')->once()->andReturn([$wrapperMessage]);
+    // No send() or ack() — time has arrived, job should be unwrapped and processed normally
+
+    $queue = $this->makeQueue($client);
+    $job   = $queue->pop();
+
+    // Body should be the unwrapped original payload
+    expect($job)->not->toBeNull();
+    expect($job->getRawBody())->toBe($originalPayload);
+});
+
+it('pop re-queues wrapper with another wrapper when remaining time still exceeds 12h', function () {
+    // 20 hours remaining — still needs more than one hop
+    $futureTime = time() + (20 * 3600);
+
+    $wrapperMessage = $this->makeMessage([
+        'lease_id' => 'lease-wrapper',
+        'body'     => json_encode([
+            '__cf_delay_wrapper' => true,
+            '__cf_execute_at'    => $futureTime,
+            '__cf_payload'       => json_encode(['uuid' => 'real-job']),
+        ]),
+    ]);
+
+    $client = Mockery::mock(CloudflareClient::class);
+    $client->shouldReceive('pull')->once()->andReturn([$wrapperMessage]);
+    $client->shouldReceive('send')
+        ->once()
+        ->withArgs(function ($sentPayload, $delay) {
+            $body = json_decode($sentPayload, true);
+            // Must still be a wrapper (remaining > 12h)
+            return isset($body['__cf_delay_wrapper'])
+                && $delay === \OssyCodes\LaravelCloudflareQueue\CloudflareQueue::MAX_CF_DELAY_SECONDS;
+        });
+    $client->shouldReceive('ack')->once()->with('lease-wrapper');
+    // No more messages — returns null
+    $client->shouldReceive('pull')->andReturn([]);
+
+    $job = $this->makeQueue($client)->pop();
+
+    expect($job)->toBeNull();
+});
+
+it('pop sends original payload directly on the final hop when remaining fits within 12h', function () {
+    $originalPayload = json_encode(['uuid' => 'real-uuid', 'job' => 'SendEmail']);
+    // 6 hours remaining — fits in one CF delay, no wrapper needed
+    $futureTime = time() + (6 * 3600);
+
+    $wrapperMessage = $this->makeMessage([
+        'lease_id' => 'lease-wrapper',
+        'body'     => json_encode([
+            '__cf_delay_wrapper' => true,
+            '__cf_execute_at'    => $futureTime,
+            '__cf_payload'       => $originalPayload,
+        ]),
+    ]);
+
+    $client = Mockery::mock(CloudflareClient::class);
+    $client->shouldReceive('pull')->once()->andReturn([$wrapperMessage]);
+    $client->shouldReceive('send')
+        ->once()
+        ->withArgs(function ($sentPayload, $delay) use ($originalPayload) {
+            // Must send the RAW original payload, NOT a wrapper
+            $body = json_decode($sentPayload, true);
+            return $sentPayload === $originalPayload
+                && ! isset($body['__cf_delay_wrapper'])
+                && $delay === (6 * 3600);
+        });
+    $client->shouldReceive('ack')->once()->with('lease-wrapper');
+    $client->shouldReceive('pull')->andReturn([]);
+
+    $job = $this->makeQueue($client)->pop();
+
+    expect($job)->toBeNull();
+});
+
 afterEach(fn () => Mockery::close());
