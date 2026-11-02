@@ -191,4 +191,6 @@ MIT
 
 ## How do I say Thank you?
 
+[![Fund my work on FLOSSAfrica](https://flossafrica.com/badge.svg)](https://flossafrica.com/m/ossycodes?p=laravel-cloudflare-queue)
+
 Please buy me a cup of coffee https://www.paypal.com/paypalme/osaigbovoemmanuel , Leave a star and follow me on [Twitter](https://twitter.com/ossycodes) .
